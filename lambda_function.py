@@ -16,7 +16,16 @@ table = dynamodb.Table("InterestChatHistory")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # -----------------------
-# GEMINI NLP PARSING (urllib)
+# GEMINI JSON CLEANER
+# -----------------------
+def extract_json(text):
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if not match:
+        raise ValueError("No JSON found in Gemini response")
+    return json.loads(match.group())
+
+# -----------------------
+# GEMINI NLP PARSING
 # -----------------------
 def parse_with_gemini(user_text):
     if not GEMINI_API_KEY:
@@ -28,16 +37,24 @@ def parse_with_gemini(user_text):
     )
 
     prompt = f"""
-Extract interest calculation details as JSON ONLY.
+You must return STRICT JSON.
+No trailing commas.
+No comments.
+No markdown.
+No explanation.
+
+If any field is missing, infer it.
 
 Text:
 "{user_text}"
 
-Return JSON with:
-principal (number),
-rate (number),
-time (number),
-type ("simple" or "compound")
+Return ONLY this JSON format:
+{{
+  "principal": 0,
+  "rate": 0,
+  "time": 0,
+  "type": "simple"
+}}
 """
 
     payload = {
@@ -61,8 +78,13 @@ type ("simple" or "compound")
         result = response.read().decode("utf-8")
 
     parsed = json.loads(result)
+
+    if not parsed.get("candidates"):
+        raise ValueError("Empty Gemini response")
+
     text = parsed["candidates"][0]["content"]["parts"][0]["text"]
-    return json.loads(text)
+
+    return extract_json(text)
 
 # -----------------------
 # RULE-BASED NLP (FALLBACK)
@@ -85,13 +107,13 @@ def parse_amount(text):
     raise ValueError("Principal amount not found")
 
 def parse_rate(text):
-    rate = re.search(r'(\d+(\.\d+)?)\s*(%|percent)', text.lower())
+    rate = re.search(r'(\d+(\.\d+)?)\s*(%|percent)', text)
     if rate:
         return float(rate.group(1))
     raise ValueError("Interest rate not found")
 
 def parse_time(text):
-    time = re.search(r'(\d+(\.\d+)?)\s*(year|years|yr)', text.lower())
+    time = re.search(r'(\d+(\.\d+)?)\s*(year|years|yr)', text)
     if time:
         return float(time.group(1))
     raise ValueError("Time period not found")
@@ -127,10 +149,9 @@ def calculate_interest(p, r, t, interest_type):
 # -----------------------
 def lambda_handler(event, context):
     try:
-        # ---------- SAFE BODY HANDLING ----------
         body = event.get("body")
 
-        # If body is missing (Lambda test, OPTIONS, etc.)
+        # Health check / browser hit
         if body is None:
             return {
                 "statusCode": 200,
@@ -144,9 +165,16 @@ def lambda_handler(event, context):
                 })
             }
 
-        # If body is a string (API Gateway normal case)
+        # Real API Gateway request → string
         if isinstance(body, str):
-            body = json.loads(body)
+            try:
+                body = json.loads(body)
+            except json.JSONDecodeError:
+                raise ValueError("Request body must be valid JSON")
+
+        # API Gateway test → dict
+        if not isinstance(body, dict):
+            raise ValueError("Invalid request body format")
 
         user_message = body.get("message")
         if not user_message:
